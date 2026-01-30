@@ -58,16 +58,14 @@ int main(void) {
 \end{ppprogram}
 
 \begin{ppdefn}
-\ppterm{Control divergence}\index{control divergence} occurs when not all threads execute the same control path.
+\ppterm{Control divergence}\\\index{control divergence} occurs when not all threads execute the same control path.
 One thread may perform a setup-like task (e.g., recording the team size), while other threads skip that work.
 This code segment shown above~\ref{prog:tid-conditional} is an early glimpse of task-based parallelism: different threads may perform different roles even within the same parallel region.
 \end{ppdefn}
 
 \begin{figure}[h]
     \centering
-    \fbox{\parbox{0.75\textwidth}{\centering
-    \textbf{[Figure: Control Divergence Illustration]}\\[0.5em]
-    A diagram showing multiple threads (T0, T1, T2, T3) where T0 takes a different branch (executes the if-block) while T1--T3 skip it. Arrows indicate the divergent control paths rejoining after the conditional.}}
+    \includegraphics[width=0.75\textwidth]{thread_divergence.png}
     \caption{Control divergence: Thread~0 executes the conditional block while other threads skip it.}
     \label{fig:control-divergence}
 \end{figure}
@@ -88,11 +86,9 @@ Yes. OpenMP provides \texttt{\#pragma omp single}~\cite{openmp-spec}. Exactly on
 
 \begin{figure}[h]
     \centering
-    \fbox{\parbox{0.75\textwidth}{\centering
-    \textbf{[Figure: \texttt{single} Directive Execution]}\\[0.5em]
-    Timeline showing threads T0--T3. One thread (chosen by runtime) executes the single block while others wait at the implicit barrier. After the block completes, all threads proceed together.}}
-    \caption{The \texttt{single} directive with implicit barrier synchronization.}
-    \label{fig:single-directive}
+    \includegraphics[width=0.75\textwidth]{barrier.jpg}
+    \caption{Single thread executes the block; other threads wait at the implicit barrier.(Note that the single thread is arbitarily chosen by runtime but the figure shows thread 0 for illustration.)}
+    \label{fig:barrier-implicit}
 \end{figure}
 
 \begin{ppprogram}{\texttt{omp single} with implicit barrier}{prog:omp-single}
@@ -182,14 +178,6 @@ Now suppose we want to add synchronization to the conditional approach so that a
 \\An OpenMP \ppterm{barrier}\index{barrier} is a \emph{team-wide synchronization point}. Every thread in the team must arrive at the barrier before any thread is allowed to proceed past it. In addition, a barrier implies a memory consistency action (a ``flush''\index{flush} of shared variables) so that writes performed before the barrier become visible to reads after the barrier.
 \end{ppdefn}
 
-\begin{figure}[h]
-    \centering
-    \fbox{\parbox{0.75\textwidth}{\centering
-    \textbf{[Figure: Barrier Synchronization]}\\[0.5em]
-    Timeline showing threads T0--T3 arriving at a barrier at different times. Dashed vertical line represents the barrier. All threads wait until the last thread arrives, then all proceed simultaneously.}}
-    \caption{Barrier semantics: threads wait until all have arrived.}
-    \label{fig:barrier-sync}
-\end{figure}
 
 OpenMP provides the directive \texttt{\#pragma omp barrier} for this purpose.
 
