@@ -1,0 +1,204 @@
+\documentclass{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\title{Parallel\_Scribe}
+\author{Amber Agarwal}
+\date{January 2026}
+
+% ---------- Listings setup (C/OpenMP) ----------
+\lstdefinestyle{c_omp}{
+  language=C,
+  basicstyle=\ttfamily\small,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=4,
+  breaklines=true,
+  breakatwhitespace=true,
+  commentstyle=\itshape\color{gray!70!black},
+  keywordstyle=\bfseries,
+}
+\lstset{style=c_omp}
+
+\begin{document}
+\maketitle
+
+\section{More on OpenMP}
+
+This section delves deeper into additional OpenMP primitives, starting with \emph{thread-specific control flow}: situations where some threads execute a piece of code while others do not. We will use the OpenMP thread identifier \texttt{tid} (returned by \texttt{omp\_get\_thread\_num()}) and a shared variable \texttt{numt} to store the number of threads in the current parallel region (returned by \texttt{omp\_get\_num\_threads()}).
+
+\subsection{Thread-specific control flow via conditionals}
+
+Consider the following example.
+
+\begin{lstlisting}[caption={Code 1: Naive thread-specific control flow using a conditional (only \texttt{tid==0} writes \texttt{numt}).},label={lst:code1}]
+#include <omp.h>
+#include <stdio.h>
+
+int main(void) {
+
+    int numt, tid;
+
+    #pragma omp parallel private(tid)
+    {
+        tid = omp_get_thread_num();
+
+        if (tid == 0)
+            numt = omp_get_num_threads();
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+The value of \texttt{numt} denotes the number of threads in the \emph{current} OpenMP team. For a given parallel region, this value is fixed for the lifetime of that region, so it is wasteful (and also incorrect) to have every thread redundantly write it. In \cref{lst:code1}, we avoid redundant writes by allowing only a particular thread (here, \texttt{tid==0}) to assign \texttt{numt}.
+
+\paragraph{Terminology alert: Control divergence.}
+This example clearly depicts \emph{control divergence}: not all threads execute the same control path. One thread performs a setup-like task (recording the team size), while other threads skip that work. In that sense, we see an early glimpse of task-based parallelism: different threads may perform different roles even within the same parallel region.
+
+\paragraph{Important caveat (common pitfall).}
+While \cref{lst:code1} is fine as a \emph{pattern} for ``only one thread should write this shared variable'', it does \emph{not} by itself guarantee that other threads will see the initialized value at the point they use it. If other threads read \texttt{numt} immediately afterwards, explicit synchronization is required (see \cref{sec:barrier}).
+
+\subsection{The \texttt{single} directive: one thread executes a block}
+
+This raises a natural question: \emph{Given a parallel region, can we ask OpenMP to execute a region using only a single thread?}
+
+Yes. OpenMP provides \texttt{\#pragma omp single}. Exactly one thread in the team (not predetermined; chosen by the runtime) executes the associated block. By default, \texttt{single} also introduces an \emph{implicit barrier at the end of the block}, meaning that all other threads wait until the single thread finishes that block.
+
+A minimal \texttt{single} block looks like this:
+
+\begin{lstlisting}[caption={Code 2a: \texttt{omp single} (implicit barrier at the end).},label={lst:code2a}]
+#pragma omp single
+{
+    numt = omp_get_num_threads();
+}  /* implicit barrier here */
+\end{lstlisting}
+
+\paragraph{How is \texttt{single} different from a conditional?}
+\begin{itemize}
+    \item \textbf{Work assignment:} \texttt{single} allows any available thread in the team to execute the block; a conditional fixes responsibility to a specific thread ID (often \texttt{tid==0}). If thread 0 is busy (e.g., doing heavy work elsewhere), the conditional approach can delay progress unnecessarily.
+    \item \textbf{Synchronization:} \texttt{single} has an implicit barrier by default, which makes it a safe ``initialize-once'' mechanism when other threads need the results immediately after the block. A conditional does \emph{not} automatically synchronize.
+\end{itemize}
+
+\subsubsection*{The \texttt{nowait} clause}
+
+Sometimes you want \texttt{single} to perform work by one thread \emph{without forcing all other threads to wait immediately}. For that, OpenMP provides \texttt{nowait}, which removes the implicit barrier at the end of the \texttt{single} block:
+
+\begin{lstlisting}[caption={Code 2b: \texttt{omp single nowait} (no implicit barrier).},label={lst:code2b}]
+#pragma omp single nowait
+{
+    numt = omp_get_num_threads();
+}
+\end{lstlisting}
+
+\paragraph{When is \texttt{nowait} safe?}
+Only when no other thread requires the results of the \texttt{single} block immediately after it. If they do, you must introduce synchronization later (e.g., an explicit \texttt{barrier} or a different dependency structure).
+
+\paragraph{Placement rule.}
+The \texttt{single} directive must appear \emph{inside} an OpenMP parallel region; outside a parallel region it has no useful semantics (there is no thread team from which to choose a single executor).
+
+\subsection{The \texttt{master} directive}
+
+There is another way to force \emph{the master thread} (thread 0 of the team) to execute a region: \texttt{\#pragma omp master}.
+
+\begin{itemize}
+    \item \textbf{Who executes the block?} Always \texttt{tid==0} специалистов (the master thread).
+    \item \textbf{Barrier semantics:} Unlike \texttt{single}, \texttt{master} has \emph{no implicit barrier} at the end.
+\end{itemize}
+
+\paragraph{Quick recap: what is the master thread?}
+In an OpenMP parallel region, each thread has a thread ID in \(\{0,1,\dots,\texttt{numt}-1\}\). The thread with \texttt{tid==0} is referred to as the \emph{master thread} of that team.
+
+\paragraph{Why would you want \texttt{conditional}/\texttt{single}/\texttt{master}? (applications)}
+\begin{itemize}
+    \item \textbf{Conditional (\texttt{if (tid==0)}):} Quick-and-dirty thread-specific control flow when you want a fixed thread to do a small action (e.g., update a counter, print a header). You must manage synchronization yourself if others depend on the result.
+    \item \textbf{\texttt{single}:} One-time initialization or one-time computation inside a parallel region where \emph{any} thread may do it, and where the implicit barrier is desirable for correctness (or \texttt{nowait} when you do not want to stall the team).
+    \item \textbf{\texttt{master}:} Operations that must be executed by the master thread specifically (e.g., interacting with a master-only API, coordinating I/O policies, or maintaining a single ``coordinator'' role). Since there is no implicit barrier, it is ideal when other threads should continue working without waiting.
+\end{itemize}
+
+\paragraph{MapReduce analogy (for intuition).}
+In distributed systems such as MapReduce, one often describes a \emph{master/coordinator} that schedules work for many \emph{workers}. OpenMP is shared-memory threading (not distributed), but the intuition can still help: using \texttt{master} lets thread 0 act as a coordinator while other threads proceed. The key difference is that in OpenMP the ``master'' is simply \texttt{tid==0} within a thread team, not a separate process.
+
+\paragraph{Question.}
+When we define the number of threads as 4, does that mean there are 4 worker threads and 1 main thread, or 4 threads including the master thread?
+
+\paragraph{Answer.}
+It is the \textbf{second option}: 4 threads total in the team \emph{including} the master thread (\texttt{tid==0}). Thread IDs will be \(0,1,2,3\).
+
+\subsection{Explicit synchronization with \texttt{barrier}}\label{sec:barrier}
+
+Now suppose we want to add synchronization to the conditional approach so that all threads use \texttt{numt} only after it has been set.
+
+\paragraph{Recap: semantics of a barrier.}
+An OpenMP barrier is a \emph{team-wide synchronization point}. Every thread in the team must arrive at the barrier before any thread is allowed to proceed past it. In addition, a barrier implies a memory consistency action (a ``flush'' of shared variables) so that writes performed before the barrier become visible to reads after the barrier.
+
+OpenMP provides the directive \texttt{\#pragma omp barrier} for this.
+
+\begin{lstlisting}[caption={Code 3: Conditional control flow plus an explicit \texttt{omp barrier}.},label={lst:code3}]
+#include <omp.h>
+#include <stdio.h>
+
+int main(void){
+
+    int numt, tid ;
+
+    #pragma omp parallel shared (numt) private(tid)
+    {
+        tid = omp_get_thread_num();
+
+        if(tid == 0) numt = omp_get_num_threads();
+
+        #pragma omp barrier
+
+        printf("hello world %d of %d\n", tid, numt);
+
+    }
+}
+\end{lstlisting}
+
+\paragraph{Question.}
+Is \cref{lst:code3} equivalent to \texttt{\#pragma omp master}?
+
+\paragraph{Answer.}
+No. It is best understood as \texttt{master}-like behavior \emph{plus explicit synchronization}. The assignment
+\texttt{if (tid==0) numt = ...} matches the ``executed by master only'' idea, but the \texttt{barrier} is \emph{not} part of \texttt{master} semantics. In fact, \cref{lst:code3} is essentially:
+\begin{quote}
+``do the assignment on the master thread, then force the whole team to wait until the master is done, then continue.''
+\end{quote}
+
+\paragraph{Question.}
+What is the output of this program with and without the barrier?
+
+\paragraph{Answer (with the barrier).}
+With the barrier, all threads are guaranteed to print using the initialized value of \texttt{numt}. If the team size is 4, you will see four lines, one per thread, and each line will have \texttt{of 4}. The \emph{order is not guaranteed} (threads may print in any order), but typical output will look like:
+\begin{quote}\ttfamily
+hello world 0 of 4\\
+hello world 2 of 4\\
+hello world 1 of 4\\
+hello world 3 of 4
+\end{quote}
+
+\paragraph{Answer (without the barrier).}
+If you remove the \texttt{\#pragma omp barrier}, the program contains a race between the master thread writing \texttt{numt} and other threads reading \texttt{numt} for printing. Some threads may print before \texttt{numt} is initialized, so \texttt{numt} may appear as an uninitialized (garbage) value or an unexpected number. This is a classic pitfall: ``only one thread writes'' is not sufficient for correctness unless readers are synchronized with the writer.
+
+\section{References}
+\begin{itemize}
+    \item OpenMP Architecture Review Board, \emph{OpenMP Specifications}. Available at \url{https://www.openmp.org/specifications/}.
+ 
+\end{itemize}
+
+\end{document}
