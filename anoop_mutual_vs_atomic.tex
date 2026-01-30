@@ -1,0 +1,86 @@
+\chapter{Parallel Models and Costs}
+
+\section{What is Mutual Exclusion}
+
+\begin{ppdefn}
+\ppterm{ Mutual exclusion} ensures that only one thread at a time executes a designated \ppterm{critical section}.\
+Programmers typically use a \ppterm{lock}/\ppterm{unlock} protocol to serialize access among threads that compete to run the same code region~C.
+\end{ppdefn}
+
+Suppose there are \(n\) threads competing to execute code region~C. Using a lock, the programmer sequentializes access so that a single thread executes the critical section while the others wait.
+
+\begin{figure}[h]
+    \centering
+    % Render the image if present; otherwise show a placeholder box.
+    \IfFileExists{mutual_exclusion.png}{\includegraphics[width=0.58\textwidth]{mutual_exclusion.png}}{\fbox{\parbox{0.58\textwidth}{\centering Diagram placeholder\\Add \texttt{mutual\_exclusion.png} to render.}}}
+    \caption{Mutual exclusion using locks}
+    \label{fig:mutual_exclusion}
+\end{figure}
+
+\textbf{Figure explanation.} A critical code region is guarded by a lock—for example, an account-balance update in a banking system. Thread \(T_0\) acquires lock \texttt{v} and enters the region; threads \(T_1\) and \(T_2\) wait. Waiting threads spin (poll) on \texttt{v}. When \(T_0\) exits, it releases \texttt{v}; then \(T_1\) acquires it and enters, while the remaining threads continue to wait. In this way, execution of the critical section is serialized.
+
+\subsection{Mutual exclusion vs atomicity}
+\begin{pppitfall}
+\textbf{ Do not conflate \ppterm{mutual exclusion} with \ppterm{atomicity}.}
+\begin{itemize}
+    \item \textbf{Mutual exclusion:} Only one thread executes the critical section at a time; the running thread can still be preempted by the operating system.
+    \item \textbf{Atomicity:} A tagged sequence of instructions appears as a single, indivisible step to all observers—it cannot be interrupted or interleaved.
+\end{itemize}
+Neither property implies the other.
+\end{pppitfall}
+
+\begin{ppkey}
+ Atomicity presents an indivisible view of a sequence of actions; mutual exclusion merely serializes entry into a region. They are related but distinct guarantees.
+\end{ppkey}
+
+\begin{ppexample}
+\ppemph{ Atomicity without mutual exclusion.} The increment operation itself is atomic, but threads are not excluded from running concurrently—many threads can perform the atomic increment at the same time without lost updates.
+
+\begin{ppprogram}{OpenMP atomic increment (no mutual exclusion)}{lst:atomic-no-me}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+#include <stdio.h>
+
+int main() {
+  long long hits = 0;
+
+  #pragma omp parallel
+  {
+    // Many threads execute concurrently (no mutual exclusion),
+    // but each increment is atomic (no lost updates).
+    #pragma omp atomic
+    hits++;
+  }
+
+  printf("hits = %lld\n", hits);
+}
+\end{lstlisting}
+\end{ppprogram}
+\end{ppexample}
+
+\begin{ppexample}
+\ppemph{ Mutual exclusion without atomicity.} Each individual balance update is protected by a per-account lock (mutual exclusion holds per account), but the transfer as a whole is not atomic because the debit and credit occur in two separate locked regions. Other threads can observe intermediate state.
+
+\begin{ppprogram}{Per-account locks: transfer not atomic as a whole}{lst:me-no-atomic}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+
+// Conceptual example
+extern omp_lock_t acct_lock[];
+extern long long balance[];
+
+// Transfer money from -> to (WRONG if atomic transfer is required)
+void transfer(int from, int to, long long amount) {
+  omp_set_lock(&acct_lock[from]);
+  balance[from] -= amount;   // debit
+  omp_unset_lock(&acct_lock[from]);
+
+  // Another thread can observe the debit before the credit happens.
+
+  omp_set_lock(&acct_lock[to]);
+  balance[to] += amount;     // credit
+  omp_unset_lock(&acct_lock[to]);
+}
+\end{lstlisting}
+\end{ppprogram}
+\end{ppexample}
