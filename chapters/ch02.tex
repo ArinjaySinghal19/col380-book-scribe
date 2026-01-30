@@ -1,263 +1,277 @@
-\chapter{Mutual Exclusion and Atomicity}
-\label{ch:mutual-exclusion}
-\index{mutual exclusion}\index{atomicity}
+\chapter{OpenMP Locks}
+\label{ch:locks}
+\index{locks}
 
-This chapter explores the critical distinction between mutual exclusion and atomicity---two fundamental concepts in parallel programming that are often conflated but represent distinct guarantees. Understanding this distinction is essential for writing correct concurrent code, building on the synchronization primitives introduced in Chapter~\ref{ch:thread-control}.
+This chapter studies another important synchronization mechanism in shared-memory parallel programming: \emph{locks}. Locks are used to ensure \textbf{orderly access} to a region of code that must not be executed concurrently by multiple threads. The fundamental property achieved using locks is \textbf{mutual exclusion}, as will be seen in Chapter~\ref{ch:mutual-exclusion}.
 
-\section{What is Mutual Exclusion?}
+The discussion is motivated by the need to selectively \emph{sequentialize} parts of an otherwise parallel program. While threads are typically free to execute independently and concurrently, certain code regions---called \emph{critical regions}\index{critical region}---must be accessed in a controlled fashion to avoid incorrect behavior.
+
+\begin{ppnote}
+\textbf{\\ Relationship to other chapters:} This chapter provides the practical API for mutual exclusion using OpenMP locks. The conceptual treatment appears in Chapter~\ref{ch:mutual-exclusion}. The \texttt{single} directive introduced in Chapter~\ref{ch:thread-control} executes a region once; locks enable repeated, serialized execution by all threads.
+\end{ppnote}
+
+\section{What Is a Lock?}
 
 \begin{ppdefn}
-\ppterm{Mutual exclusion}\index{mutual exclusion!definition} ensures that only one thread at a time executes a designated \ppterm{critical section}\index{critical section}. Programmers typically use a \ppterm{lock}\index{lock}/\ppterm{unlock} protocol to serialize access among threads that compete to run the same code region. See Chapter~\ref{ch:locks} for detailed coverage of OpenMP lock primitives.
+\\ A \ppterm{lock} is an abstraction that protects a specific region of code. Conceptually:
+\begin{itemize}
+    \item Multiple threads may want to execute the same region of code $C$.
+    \item At most one thread is allowed to execute $C$ at any given time.
+    \item Other threads must wait until the currently executing thread exits $C$.
+\end{itemize}
+In simple terms, a lock \emph{locks} a region of code so that only one thread can be inside that region at a time.
 \end{ppdefn}
 
-Suppose there are $n$ threads competing to execute code region~$C$. Using a lock, the programmer sequentializes access so that a single thread executes the critical section while the others wait.
+\section{Locks vs \texttt{single}}
+\label{sec:locks-vs-single}
+
+At first glance, locks may appear similar to the OpenMP construct \texttt{\#pragma omp single} (see Section~\ref{sec:single-directive}). However, the semantics are fundamentally different:
 
 \begin{figure}[h]
     \centering
-    \fbox{\parbox{0.7\textwidth}{\centering 
-    \textbf{Mutual Exclusion Diagram}\\[0.5em]
-    A critical code region is guarded by a lock. Thread $T_0$ acquires lock \texttt{v} and enters the region; threads $T_1$ and $T_2$ wait. Waiting threads spin (poll) on \texttt{v}. When $T_0$ exits, it releases \texttt{v}; then $T_1$ acquires it and enters, while the remaining threads continue to wait. In this way, execution of the critical section is serialized.}}
-    \caption{Mutual exclusion using locks}
-    \label{fig:mutual_exclusion}
+    \includegraphics[width=0.8\textwidth]{singleVSlock.png}
+    \label{fig:locks-vs-single}
 \end{figure}
 
-\section{Mutual Exclusion vs Atomicity}
-
-\begin{pppitfall}
-\textbf{Do not conflate \ppterm{mutual exclusion} with \ppterm{atomicity}.}
-\begin{itemize}
-    \item \textbf{Mutual exclusion:} Only one thread executes the critical section at a time; the running thread can still be preempted by the operating system.
-    \item \textbf{Atomicity:} A tagged sequence of instructions appears as a single, indivisible step to all observers---it cannot be interrupted or interleaved.
-\end{itemize}
-Neither property implies the other.
-\end{pppitfall}
-
 \begin{ppkey}
-Atomicity presents an indivisible view of a sequence of actions; mutual exclusion merely serializes entry into a region. They are related but distinct guarantees.
+\begin{itemize}
+    \item \textbf{\texttt{single}:} The code region $C$ is executed by exactly one thread, and never by the others.
+    \item \textbf{Lock:} Every thread \emph{may eventually execute} $C$, but execution is serialized---one thread at a time.
+\end{itemize}
+Thus, a lock enables \emph{multiple executions in an orderly fashion}, whereas \texttt{single} enforces a \emph{single execution}.
 \end{ppkey}
 
-\section{Atomicity Without Mutual Exclusion}
-
-\begin{ppexample}
-\ppemph{Atomicity without mutual exclusion.} The increment operation itself is atomic, but threads are not excluded from running concurrently---many threads can perform the atomic increment at the same time without lost updates.
-\end{ppexample}
-
-\begin{ppprogram}{OpenMP atomic increment (no mutual exclusion)}{prog:atomic-no-me}
-\begin{lstlisting}[language=OpenMP]
-#include <omp.h>
-#include <stdio.h>
-
-int main() {
-    long long hits = 0;
-
-    #pragma omp parallel
-    {
-        // Many threads execute concurrently (no mutual exclusion),
-        // but each increment is atomic (no lost updates).
-        #pragma omp atomic
-        hits++;
-    }
-
-    printf("hits = %lld\n", hits);
-    return 0;
-}
-\end{lstlisting}
-\end{ppprogram}
-
-In this example, multiple threads can reach the \texttt{\#pragma omp atomic}\index{atomic directive@\texttt{atomic} directive} directive simultaneously. Each individual increment is atomic (no partial updates or lost writes), but the threads are not mutually excluded from executing concurrently.
-
 \begin{ppnote}
-\textbf{Hardware support:} The \texttt{atomic} directive typically compiles to hardware atomic instructions (e.g., \texttt{lock xadd} on x86). This is more efficient than acquiring a lock for simple operations like increment, decrement, or compare-and-swap.
+\\ Importantly, \texttt{single} introduces an implicit barrier at the end (unless \texttt{nowait} is specified), whereas \textbf{locks do not introduce any implicit barrier}. Threads proceed independently after unlocking.
 \end{ppnote}
 
-\section{Mutual Exclusion Without Atomicity}
+\section{Conceptual Model of Locking}
 
-\begin{ppexample}
-\ppemph{Mutual exclusion without atomicity.} Each individual balance update is protected by a per-account lock (mutual exclusion holds per account), but the transfer as a whole is not atomic because the debit and credit occur in two separate locked regions. Other threads can observe intermediate state.
-\end{ppexample}
+Consider a shared lock variable $V$:
+\begin{itemize}
+    \item $V$ resides in shared memory.
+    \item Initially, $V = 0$ (unlocked).
+    \item A thread that sets $V = 1$ acquires the lock.
+    \item Releasing the lock resets $V$ to $0$.
+\end{itemize}
 
-\begin{ppprogram}{Per-account locks: transfer not atomic as a whole}{prog:me-no-atomic}
-\begin{lstlisting}[language=OpenMP]
-#include <omp.h>
+All threads compete to acquire $V$. The first thread that succeeds enters the critical region $C$. Other threads wait.
 
-// Conceptual example
-extern omp_lock_t acct_lock[];
-extern long long balance[];
+\subsection{Spin Waiting}
 
-// Transfer money from -> to (WRONG if atomic transfer is required)
-void transfer(int from, int to, long long amount) {
-    omp_set_lock(&acct_lock[from]);
-    balance[from] -= amount;   // debit
-    omp_unset_lock(&acct_lock[from]);
+\begin{ppdefn}
+\\ In a naive implementation, waiting threads repeatedly check the value of $V$ in a loop. This is called \ppterm{spin waiting} or \ppterm{busy waiting}.
+\end{ppdefn}
 
-    // Another thread can observe the debit before the credit happens.
-
-    omp_set_lock(&acct_lock[to]);
-    balance[to] += amount;     // credit
-    omp_unset_lock(&acct_lock[to]);
+\begin{ppprogram}{Naive spin lock implementation}{prog:spin-lock}
+\begin{lstlisting}[language=C11]
+while (V != 0) {
+    // spin
 }
+V = 1;  // acquire lock
 \end{lstlisting}
 \end{ppprogram}
 
 \begin{pppitfall}
-In Program~\ref{prog:me-no-atomic}, the invariant ``total money is conserved'' can appear violated to an observer who reads both accounts between the debit and credit. The individual operations have mutual exclusion, but the composite transfer lacks atomicity.
+\\ The naive implementation in Program~\ref{prog:spin-lock} has a \emph{race condition}\index{race condition}: multiple threads may simultaneously observe \texttt{V == 0} and both proceed to set \texttt{V = 1}. Real lock implementations use atomic operations (such as compare-and-swap\index{compare-and-swap}, or CAS) to avoid this. This is why the \texttt{omp\_lock\_t} abstraction exists---it handles these low-level details correctly.
 \end{pppitfall}
 
-\section{Achieving Both: A Bank Transfer Example}
-\label{sec:bank-transfer}
-\index{bank transfer example}
+Modern processors and runtimes optimize spin waiting behavior, but the fundamental idea remains: waiting threads repeatedly check the lock state until it becomes available.
 
-To make a transfer truly atomic (as well as mutually exclusive), we must hold locks on \emph{both} accounts for the duration of the entire operation. This example demonstrates the practical application of locks covered in Chapter~\ref{ch:locks}.
+\section{Sequentialization in a Parallel Program}
+
+A natural question arises:
+
+\begin{quote}
+\emph{If $n$ threads execute the same region $C$ sequentially using a lock, is this equivalent to executing $n$ copies of $C$ sequentially?}
+\end{quote}
+
+\begin{ppkey}
+\\ Yes, and that is the point. Locks provide a programming-language-level abstraction that allows the programmer to intentionally serialize execution of a critical region within a parallel program.
+
+Without such an abstraction, threads would execute $C$ concurrently and cause incorrect behavior. Locks give the programmer explicit control over where and how sequentialization occurs.
+\end{ppkey}
+
+\section{Fairness, Starvation, and Scheduling}
+
+\begin{pppitfall}
+\\ It is possible for a thread to:
+\begin{itemize}
+    \item Release a lock,
+    \item Reach the next iteration,
+    \item And re-acquire the lock again before other threads.
+\end{itemize}
+This can lead to \ppterm{starvation}, where some threads never get a chance to execute a certain code section$C$.
+\end{pppitfall}
+
+Whether starvation happens depends on:
+\begin{itemize}
+    \item The lock implementation,
+    \item Scheduling policies,
+    \item Hardware and runtime behavior.
+\end{itemize}
+
+Designing \emph{fair} synchronization primitives is an active research topic spanning operating systems, architecture, and programming languages.
+
+\section{Race Conditions vs Data Races}
+
+The lecture emphasizes an important distinction:
+
+\begin{ppdefn}
+\begin{description}
+    \item[\ppterm{Race condition}:] Multiple threads competing to acquire a resource. This is \emph{intentional} and necessary for locks.
+    \item[\ppterm{Data race}:] Concurrent access to shared data where at least one access is a write and accesses are unordered. This is \emph{incorrect}.
+\end{description}
+\end{ppdefn}
+
+\begin{ppkey}
+\\ Locks \textbf{allow race conditions} (competition to acquire the lock) but \textbf{prevent data races} inside the protected region.
+
+Since only one thread executes $C$ at a time, shared variables inside $C$ cannot be concurrently modified.
+\end{ppkey}
+
+\section{How Do Threads Observe Unlocking?}
+
+Threads waiting for a lock repeatedly read the shared lock variable from memory. Conceptually:
+\begin{itemize}
+    \item The lock variable $V$ is stored at a memory address.
+    \item Waiting threads issue repeated read requests for $V$.
+    \item When $V$ changes (unlock), threads observe the update and compete to acquire it.
+\end{itemize}
+
+The runtime system ensures that only one thread succeeds in acquiring the lock, even if multiple threads attempt simultaneously.
+
+\section{OpenMP Lock Primitives}
+\label{sec:lock-primitives}
+\index{omp\_lock\_t}\index{omp\_nest\_lock\_t}
+
+OpenMP exposes lock functionality explicitly through library calls~\cite{openmp-spec}. Unlike the directive-based constructs (\texttt{parallel}, \texttt{single}, \texttt{critical}), locks are managed via explicit function calls, giving the programmer fine-grained control.
+
+\subsection{Lock Types}
 
 \begin{ppnote}
-\textbf{Memory allocation note:} The code uses \texttt{calloc()}\index{calloc()} rather than \texttt{malloc()}. Both return a contiguous block of memory; the key difference is that \texttt{calloc} zero-initializes. Whether \texttt{calloc} is slower depends on the allocator/OS (zeroing may be optimized); do not assume performance characteristics without measurement.
+\\ OpenMP provides two lock types:
+\begin{itemize}
+    \item \texttt{omp\_lock\_t}: Normal (non-nestable) lock.
+    \item \texttt{omp\_nest\_lock\_t}: Nestable lock that allows re-acquisition by the same thread.
+\end{itemize}
 \end{ppnote}
 
-\begin{ppprogram}{Correct atomic transfer using a global lock}{prog:atomic-transfer}
+\subsection{Lock API}
+
+\begin{ppprogram}{OpenMP lock API}{prog:lock-api}
 \begin{lstlisting}[language=OpenMP]
-#include <stdio.h>
-#include <stdlib.h>
+void omp_init_lock(omp_lock_t *lock);
+void omp_set_lock(omp_lock_t *lock);    // acquire
+void omp_unset_lock(omp_lock_t *lock);  // release
+void omp_destroy_lock(omp_lock_t *lock);
+
+int omp_test_lock(omp_lock_t *lock);    // try-acquire
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppkey}
+\\ \texttt{omp\_test\_lock} returns immediately:
+\begin{itemize}
+    \item Non-zero if the lock was acquired,
+    \item Zero otherwise (no blocking).
+\end{itemize}
+\end{ppkey}
+
+\subsection{Using \texttt{omp\_test\_lock}}
+
+\begin{ppprogram}{Using test lock for non-blocking acquisition}{prog:test-lock-usage}
+\begin{lstlisting}[language=OpenMP]
+int flag = 0;
+while (!flag) {
+    flag = omp_test_lock(&lock);
+    // Optionally do other work while waiting
+}
+// Lock acquired, proceed with critical section
+\end{lstlisting}
+\end{ppprogram}
+
+\section{Complete Lock Example}
+
+\begin{ppexample}
+\\ Here is a complete example demonstrating proper lock usage to protect a shared counter:
+\end{ppexample}
+
+\begin{ppprogram}{Protecting a shared counter with locks}{prog:lock-counter}
+\begin{lstlisting}[language=OpenMP]
 #include <omp.h>
+#include <stdio.h>
 
 int main() {
-    const int N_ACCTS = 8;
-    const int N_TXNS = 2000000;
-
-    long long *balance = (long long *)calloc(N_ACCTS, sizeof(long long));
-    if (!balance) return 1;
-
-    // Initialize all accounts
-    for (int i = 0; i < N_ACCTS; i++) {
-        balance[i] = 1000;
-    }
-
-    omp_lock_t ledger_lock;
-    omp_init_lock(&ledger_lock);
-
-    double t0 = omp_get_wtime();
-
+    int counter = 0;
+    omp_lock_t lock;
+    
+    omp_init_lock(&lock);
+    
     #pragma omp parallel
     {
-        unsigned int seed = (unsigned int)omp_get_thread_num();
-
-        #pragma omp for schedule(static)
-        for (int k = 0; k < N_TXNS; k++) {
-            int from = (int)(rand_r(&seed) % N_ACCTS);
-            int to = (int)(rand_r(&seed) % N_ACCTS);
-            if (from == to) continue;
-
-            long long amount = (long long)(rand_r(&seed) % 5);
-
-            // Critical section via an explicit lock
-            omp_set_lock(&ledger_lock);
-
-            balance[from] -= amount;
-            balance[to] += amount;
-
-            omp_unset_lock(&ledger_lock);
+        for (int i = 0; i < 1000; i++) {
+            omp_set_lock(&lock);
+            counter++;  // Critical section
+            omp_unset_lock(&lock);
         }
     }
-
-    double t1 = omp_get_wtime();
-
-    omp_destroy_lock(&ledger_lock);
-
-    // Check conservation invariant
-    long long total = 0;
-    for (int i = 0; i < N_ACCTS; i++)
-        total += balance[i];
-
-    printf("Initial total = %lld\n", N_ACCTS * 1000LL);
-    printf("Final total   = %lld\n", total);
-    printf("Elapsed time  = %f seconds\n", t1 - t0);
-
-    free(balance);
+    
+    omp_destroy_lock(&lock);
+    
+    printf("Counter = %d\n", counter);
     return 0;
 }
 \end{lstlisting}
 \end{ppprogram}
 
 \begin{ppnote}
-\textbf{Key observations from this example:}
-\begin{itemize}
-    \item The example models concurrent access to shared state: multiple threads perform ``transfers'' between bank accounts.
-    \item Without synchronization, updates to shared balances can interleave unpredictably, producing non-deterministic results.
-    \item Each transfer conceptually performs a read--modify--write on two shared memory locations: \texttt{balance[from]} and \texttt{balance[to]}.
-    \item A data race occurs when two threads access the same location concurrently and at least one access is a write, with no ordering enforced.
-\end{itemize}
+\\ Without the lock in Program~\ref{prog:lock-counter}, the increment operation would suffer from lost updates---the final counter value would be unpredictable and less than expected.
 \end{ppnote}
 
-\begin{ppkey}
-\textbf{Correctness specification (invariants and post-condition):}
-\begin{itemize}
-    \item Desired invariant: the sum of all balances should remain constant (``conservation of money'').
-    \item Each valid transfer subtracts \texttt{amount} from one account and adds the same \texttt{amount} to another.
-    \item If every transfer is applied atomically as a pair, then total money is preserved.
-\end{itemize}
-\end{ppkey}
-
-\section{Performance Considerations}
-\label{sec:perf-considerations}
-\index{lock contention}\index{Amdahl's Law}
-
-\begin{pppitfall}
-\textbf{What the lock guarantees (and what it costs):}
-\begin{itemize}
-    \item \textbf{Correctness:} Prevents lost updates and makes the invariant check meaningful.
-    \item \textbf{Performance:} If every iteration takes the same global lock, the parallel loop becomes effectively serialized.
-\end{itemize}
-This is an instance of \emph{lock contention} and \emph{Amdahl's Law}: a large serialized fraction limits speedup.
-\end{pppitfall}
-
-\begin{figure}[h]
-    \centering
-    \fbox{\parbox{0.75\textwidth}{\centering
-    \textbf{[Figure: Lock Contention and Scalability]}\\[0.5em]
-    Graph showing speedup vs.\ number of threads. Ideal linear speedup (dashed line) compared to actual speedup with global lock (nearly flat line approaching 1). Illustrates how a serialized critical section limits parallel efficiency.}}
-    \caption{Lock contention limits parallel speedup as predicted by Amdahl's Law.}
-    \label{fig:lock-contention}
-\end{figure}
+\section{Key Takeaway}
 
 \begin{ppkey}
-\textbf{Theory-first takeaway:}
-\begin{itemize}
-    \item Correctness in shared-memory parallelism requires explicit reasoning about atomicity and ordering.
-    \item A single global lock is the simplest correctness mechanism, but it often eliminates scalability.
-    \item This example cleanly separates: (1) the \emph{spec} (invariant), (2) the \emph{race}, and (3) the \emph{cost} of naive synchronization.
-\end{itemize}
+\\ Locks help achieve \textbf{race-freedom} (specifically, freedom from data races) when accessing a critical region. They enforce \textbf{mutual exclusion} among competing threads without introducing implicit synchronization barriers.
 \end{ppkey}
 
 \section{Summary}
 
-This chapter distinguished two fundamental but often conflated concepts:
+This chapter covered the OpenMP lock API for implementing mutual exclusion:
 \begin{itemize}
-    \item \textbf{Mutual exclusion:} Serializes access to a critical section; one thread at a time.
-    \item \textbf{Atomicity:} Makes a sequence of operations appear indivisible to all observers.
+    \item Locks enable serialized access to critical regions, unlike \texttt{single} which executes code only once.
+    \item The \texttt{omp\_lock\_t} type and associated functions (\texttt{init}, \texttt{set}, \texttt{unset}, \texttt{destroy}, \texttt{test}) provide explicit lock management.
+    \item Locks introduce race conditions (threads competing for the lock) but prevent data races inside the protected region.
+    \item Fairness and starvation are implementation-dependent concerns.
 \end{itemize}
-Neither implies the other. The bank transfer example demonstrated how to achieve both using a global lock, while highlighting the performance cost. Chapter~\ref{ch:locks} provides the detailed API for implementing these patterns.
 
 \section{Exercises}
 
 \begin{ppexercises}
-  \ppexercise{Explain why \texttt{\#pragma omp atomic} cannot replace locks when you need to atomically update multiple variables.}
+  \ppexercise{Explain why \texttt{omp\_single} cannot replace locks when all threads must eventually execute a critical region.}
   
-  \ppexercise{Modify Program~\ref{prog:atomic-transfer} to use per-account locks instead of a global lock. What additional care is needed to avoid deadlock? (Hint: consider lock ordering.)}
-  
-  \ppexercise{Consider a scenario where threads only read account balances without modifying them. Is mutual exclusion still necessary? What about atomicity? Justify your answer.}
-  
-  \ppexercise{Classify the following operations as requiring mutual exclusion, atomicity, both, or neither:
+  \ppexercise{Write a small OpenMP program where threads increment a shared counter:
   \begin{itemize}
-      \item Incrementing a shared counter
-      \item Reading a 64-bit value on a 32-bit architecture
-      \item Swapping two elements in an array
-      \item Appending to a log file
+      \item First without locks (observe incorrect result),
+      \item Then using \texttt{omp\_lock\_t}.
+  \end{itemize}
+  Compile with \texttt{gcc -fopenmp} and run multiple times. Explain the difference in results.}
+  
+  \ppexercise{Consider a lock that is unfair. Explain how starvation may arise with a looped critical region. Draw a timeline showing a possible execution where thread~0 acquires the lock 10 times before thread~1 acquires it once.}
+  
+  \ppexercise{Classify the following as race condition, data race, both, or neither, and justify your answer:
+  \begin{itemize}
+      \item Two threads calling \texttt{omp\_set\_lock} on the same lock
+      \item Two threads incrementing the same variable without synchronization
+      \item Two threads reading the same constant
+      \item One thread writing while another reads without synchronization
   \end{itemize}}
   
-  \ppexercise{In Program~\ref{prog:atomic-transfer}, replace the global lock with \texttt{\#pragma omp critical}. Does this change correctness? Performance? Explain.}
+  \ppexercise{Compare and contrast using \texttt{\#pragma omp critical} with explicit locks via \texttt{omp\_lock\_t}. When would you prefer one over the other? Consider both correctness and performance.}
   
-  \ppexercise{Design a fine-grained locking scheme for the bank transfer that avoids deadlock. Analyze the expected performance improvement over the global lock approach.}
+  \ppexercise{Modify Program~\ref{prog:lock-counter} to use \texttt{omp\_test\_lock} with a fallback to doing other work when the lock is not available. Measure whether this improves performance compared to blocking on \texttt{omp\_set\_lock}.}
 \end{ppexercises}
 
 \section*{References}
 \addcontentsline{toc}{section}{References}
-See the OpenMP Specification~\cite{openmp-spec} for authoritative documentation on \texttt{atomic} and other synchronization constructs.
+See the OpenMP Specification~\cite{openmp-spec} for authoritative documentation on lock primitives and their semantics.
