@@ -1,16 +1,20 @@
 
 \documentclass[11pt,a4paper]{article}
 \usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{hyperref}
-\usepackage{amsmath}
-\usepackage{listings}
 \usepackage{xcolor}
+\usepackage{listings}
 \usepackage{enumitem}
 \usepackage{booktabs}
 \usepackage{caption}
+
 \lstset{
   basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{teal},
   breaklines=true,
   frame=single,
   numbers=left,
@@ -18,281 +22,175 @@
   showstringspaces=false
 }
 
-\title{OpenMP Locks: Reference, Examples, Best Practices, and Transcription Evaluation Rubric}
-\author{Lecture notes (derived from provided slides) }
+\title{Scribe Notes: OpenMP Locks and Mutual Exclusion}
+\author{COL380 / OpenMP Lectures}
 \date{\today}
 
 \begin{document}
 \maketitle
 
-\begin{abstract}
-This document collects a precise and practical reference for OpenMP locks (mutual exclusion primitives), detailed usage examples with explanations, common pitfalls and best practices, plus an evaluation rubric used to grade lecture transcriptions (``transcriptionEval''). The goal is to produce a self-contained \LaTeX{} source that can be compiled and used as handout or grading specification.
-\end{abstract}
+\section{Context and Motivation}
+In this lecture segment, we study another important synchronization mechanism in shared-memory parallel programming: \emph{locks}. Locks are used to ensure \textbf{orderly access} to a region of code that must not be executed concurrently by multiple threads. The fundamental property achieved using locks is \textbf{mutual exclusion}.
 
-\section{Overview}
-Locks are synchronization primitives that provide mutual exclusion: they let one thread (or task) own exclusive access to a critical resource or section of code. OpenMP exposes a small API for locks in C/C++ and Fortran. Locks are useful when:
+The discussion is motivated by the need to selectively \emph{sequentialize} parts of an otherwise parallel program. While threads are typically free to execute independently and concurrently, certain code regions---called \emph{critical regions}---must be accessed in a controlled fashion to avoid incorrect behavior.
+
+\section{What Is a Lock?}
+A lock is an abstraction that protects a specific region of code. Conceptually:
 \begin{itemize}
-  \item A critical region cannot be expressed using \texttt{\#pragma omp critical} (for example, when you need a lock object to protect multiple distinct regions or fine-grained locking).
-  \item You need explicit control over locking (try-lock semantics, nested locking, or lock object lifetime).
-  \item Protecting non-thread-safe library data structures or I/O state.
+  \item Multiple threads may want to execute the same region of code $C$.
+  \item At most one thread is allowed to execute $C$ at any given time.
+  \item Other threads must wait until the currently executing thread exits $C$.
 \end{itemize}
 
-\section{OpenMP lock types}
-OpenMP provides two main lock types:
+In simple terms, a lock \emph{locks} a region of code so that only one thread can be inside that region at a time.
+
+\subsection{Comparison with \texttt{\#pragma omp single}}
+At first glance, locks may appear similar to the OpenMP construct:
+\begin{lstlisting}
+#pragma omp single
+{
+   C;
+}
+\end{lstlisting}
+
+However, the semantics are fundamentally different:
+\begin{itemize}
+  \item \texttt{single}: The code region $C$ is executed by exactly one thread, and never by the others.
+  \item \textbf{lock}: Every thread \emph{may eventually execute} $C$, but execution is serialized---one thread at a time.
+\end{itemize}
+
+Thus, a lock enables \emph{multiple executions in an orderly fashion}, whereas \texttt{single} enforces a \emph{single execution}.
+
+Importantly, \texttt{single} introduces an implicit barrier at the end (unless \texttt{nowait} is specified), whereas \textbf{locks do not introduce any implicit barrier}. Threads proceed independently after unlocking.
+
+\section{Conceptual Model of Locking}
+Consider a shared lock variable $V$:
+\begin{itemize}
+  \item $V$ resides in shared memory.
+  \item Initially, $V = 0$ (unlocked).
+  \item A thread that sets $V = 1$ acquires the lock.
+  \item Releasing the lock resets $V$ to $0$.
+\end{itemize}
+
+All threads compete to acquire $V$. The first thread that succeeds enters the critical region $C$. Other threads wait.
+
+\subsection{Spin Waiting (Na\"ive Lock Implementation)}
+In a na\"ive implementation, waiting threads repeatedly check the value of $V$ in a loop:
+\begin{lstlisting}[language=C]
+while (V != 0) {
+    // spin
+}
+V = 1;  // acquire lock
+\end{lstlisting}
+
+This is called \emph{spin waiting} or \emph{busy waiting}. Threads continuously poll the shared variable until the lock becomes available.
+
+Modern processors and runtimes optimize this behavior, but the fundamental idea remains: waiting threads repeatedly check the lock state.
+
+\section{Sequentialization in a Parallel Program}
+A natural question arises:
+
+\begin{quote}
+If $n$ threads execute the same region $C$ sequentially using a lock, is this equivalent to executing $n$ copies of $C$ sequentially?
+\end{quote}
+
+Yes---\textbf{and that is the point}. Locks provide a programming-language-level abstraction that allows the programmer to intentionally serialize execution of a critical region within a parallel program.
+
+Without such an abstraction, threads would execute $C$ concurrently and cause incorrect behavior. Locks give the programmer explicit control over where and how sequentialization occurs.
+
+\section{Fairness, Starvation, and Scheduling}
+It is possible for a thread to:
+\begin{itemize}
+  \item Release a lock,
+  \item Reach the next iteration,
+  \item And re-acquire the lock again before other threads.
+\end{itemize}
+
+This can lead to \textbf{starvation}, where some threads never get a chance to execute $C$. Whether this happens depends on:
+\begin{itemize}
+  \item The lock implementation,
+  \item Scheduling policies,
+  \item Hardware and runtime behavior.
+\end{itemize}
+
+Designing \emph{fair} synchronization primitives is an active research topic spanning operating systems, architecture, and programming languages.
+
+\section{Race Conditions vs Data Races}
+The lecture emphasizes an important distinction:
+
 \begin{description}
-  \item[\texttt{omp\_lock\_t}] A standard (non-nestable) lock. A thread cannot re-acquire the same lock if it already holds it (doing so may lead to deadlock).
-  \item[\texttt{omp\_nest\_lock\_t}] A nestable (recursive) lock. The same thread can acquire it multiple times; each acquisition increases an internal recursion count and must be released the same number of times.
+  \item[Race condition:] Multiple threads competing to acquire a resource. This is \emph{intentional} and necessary for locks.
+  \item[Data race:] Concurrent access to shared data where at least one access is a write and accesses are unordered. This is \emph{incorrect}.
 \end{description}
 
-\section{OpenMP lock API (C interface)}
-Below are the typical function prototypes (C/C++) and short descriptions:
+Locks \textbf{allow race conditions} (competition to acquire the lock) but \textbf{prevent data races} inside the protected region.
 
-\begin{lstlisting}
-// Initialize/destroy
+Since only one thread executes $C$ at a time, shared variables inside $C$ cannot be concurrently modified.
+
+\section{How Do Threads Observe Unlocking?}
+Threads waiting for a lock repeatedly read the shared lock variable from memory. Conceptually:
+\begin{itemize}
+  \item The lock variable $V$ is stored at a memory address.
+  \item Waiting threads issue repeated read requests for $V$.
+  \item When $V$ changes (unlock), threads observe the update and compete to acquire it.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\linewidth]{9a1fc4d5-6aec-4193-be3f-2a694cf8d369.png}
+\caption{Slide reference: OpenMP lock primitives and semantics}
+\end{figure}
+
+The runtime system ensures that only one thread succeeds in acquiring the lock, even if multiple threads attempt simultaneously.
+
+\section{OpenMP Lock Primitives}
+OpenMP exposes lock functionality explicitly through library calls.
+
+\subsection{Lock Types}
+\begin{itemize}
+  \item \texttt{omp\_lock\_t}: Normal (non-nestable) lock.
+  \item \texttt{omp\_nest\_lock\_t}: Nestable lock that allows re-acquisition by the same thread.
+\end{itemize}
+
+\subsection{Lock API}
+\begin{lstlisting}[language=C]
 void omp_init_lock(omp_lock_t *lock);
+void omp_set_lock(omp_lock_t *lock);    // acquire
+void omp_unset_lock(omp_lock_t *lock);  // release
 void omp_destroy_lock(omp_lock_t *lock);
 
-// Acquire/release (blocking)
-void omp_set_lock(omp_lock_t *lock);   // Blocks until lock acquired
-void omp_unset_lock(omp_lock_t *lock); // Releases the lock
-
-// Try-acquire (non-blocking)
-int omp_test_lock(omp_lock_t *lock);   // Returns non-zero if acquired, 0 otherwise
-
-// Nestable lock variants:
-void omp_init_nest_lock(omp_nest_lock_t *lock);
-void omp_destroy_nest_lock(omp_nest_lock_t *lock);
-void omp_set_nest_lock(omp_nest_lock_t *lock);
-void omp_unset_nest_lock(omp_nest_lock_t *lock);
-int omp_test_nest_lock(omp_nest_lock_t *lock);
+int omp_test_lock(omp_lock_t *lock);    // try-acquire
 \end{lstlisting}
 
-\textbf{Notes:}
+\texttt{omp\_test\_lock} returns immediately:
 \begin{itemize}
-  \item \texttt{omp\_set\_lock} blocks the calling thread until the lock becomes available; it cannot fail.
-  \item \texttt{omp\_test\_lock} attempts to acquire the lock and returns immediately: non-zero (true) if the lock was acquired, zero (false) otherwise.
-  \item Always initialize locks before use and destroy them when no longer needed to avoid resource leaks.
-  \item Nestable locks maintain a recursion count and require a matching number of \texttt{unset} calls.
+  \item Non-zero if the lock was acquired,
+  \item Zero otherwise (no blocking).
 \end{itemize}
 
-\section{Minimal examples}
-
-\subsection{Simple lock protecting a counter}
+Typical usage:
 \begin{lstlisting}[language=C]
-// simple_lock_example.c
-#include <stdio.h>
-#include <omp.h>
-
-int main() {
-    omp_lock_t lock;
-    omp_init_lock(&lock);
-
-    int counter = 0;
-    #pragma omp parallel num_threads(4)
-    {
-        for (int i = 0; i < 10000; ++i) {
-            omp_set_lock(&lock);   // acquire
-            counter += 1;
-            omp_unset_lock(&lock); // release
-        }
-    }
-
-    omp_destroy_lock(&lock);
-    printf("counter = %d\n", counter);
-    return 0;
+while (!flag) {
+    flag = omp_test_lock(&lock);
 }
 \end{lstlisting}
 
-\textbf{Explanation:} Each iteration increments the shared \texttt{counter} under the protection of the lock. This avoids a race on \texttt{counter} at the cost of blocking and serialization.
-
-\subsection{Try-lock pattern (spin with test)}
-\begin{lstlisting}[language=C]
-// try_lock_spin.c
-#include <stdio.h>
-#include <omp.h>
-
-int main() {
-    omp_lock_t lock;
-    omp_init_lock(&lock);
-    int flag = 0;
-
-    #pragma omp parallel num_threads(4)
-    {
-        int acquired = 0;
-        while (!acquired) {
-            acquired = omp_test_lock(&lock); // returns non-zero if acquired
-            // Optionally do polite backoff or yield to avoid busy-wait hogging
-            if (!acquired) {
-                // simple backoff
-                #pragma omp taskyield
-            }
-        }
-        // critical region
-        // ...
-        omp_unset_lock(&lock);
-    }
-
-    omp_destroy_lock(&lock);
-    return 0;
-}
-\end{lstlisting}
-
-\textbf{Explanation:} \texttt{omp\_test\_lock} implements non-blocking attempt. Busy-wait loops should include backoff/yield to avoid CPU waste.
-
-\subsection{Nested lock usage}
-\begin{lstlisting}[language=C]
-// nested_lock_example.c
-#include <stdio.h>
-#include <omp.h>
-
-int main() {
-    omp_nest_lock_t nlock;
-    omp_init_nest_lock(&nlock);
-
-    #pragma omp parallel num_threads(4)
-    {
-        omp_set_nest_lock(&nlock); // first acquisition
-        // safe to call again in same thread:
-        omp_set_nest_lock(&nlock); // recursion count increases
-
-        // critical work
-        omp_unset_nest_lock(&nlock); // release one level
-        omp_unset_nest_lock(&nlock); // release second level
-    }
-
-    omp_destroy_nest_lock(&nlock);
-    return 0;
-}
-\end{lstlisting}
-
-\section{Locks vs \texttt{critical} vs \texttt{atomic}}
-\begin{itemize}
-  \item \texttt{\#pragma omp critical} is a simple annotation-based mutual exclusion with an (optional) name. It is easy to use and less error prone.
-  \item \texttt{atomic} is an annotation for single memory updates that can often be implemented with hardware atomic instructions (faster and more scalable than a lock).
-  \item \textbf{Locks} provide explicit object lifetime and more control (try-lock, nestable counts), and are appropriate when you need these semantics or multiple disjoint critical regions protected by the same lock object.
-\end{itemize}
-
-\section{Performance considerations and pitfalls}
-\begin{description}
-  \item[Spin-wait and CPU usage:] \texttt{omp\_set\_lock} typically blocks the thread in an efficient way, but naive spin loops using \texttt{omp\_test\_lock} can waste CPU. Insert \texttt{taskyield} or exponential backoff to be polite.
-  \item[Deadlock:] Acquiring multiple locks in inconsistent order can deadlock. Use a consistent global ordering for lock acquisition.
-  \item[Priority inversion:] Lower-priority thread holding a lock while higher-priority threads wait can cause priority inversion in some systems.
-  \item[Fairness:] Locks do not guarantee fairness in acquisition order; threads may be starved depending on implementation.
-  \item[Granularity:] Excessive locking (too coarse or too fine) hurts performance. Measure and choose suitable critical-section granularity.
-  \item[Lock contention:] If many threads contend for the same lock, the application will serialize and scale poorly.
-\end{description}
-
-\section{Best practices}
-\begin{enumerate}
-  \item Keep critical sections small and bounded.
-  \item Prefer \texttt{atomic} for simple increments or single-word updates when possible.
-  \item Initialize and destroy locks in the correct thread context; do not use destroyed locks.
-  \item Use nestable locks only when recursion from same thread is necessary; avoid overuse.
-  \item When using multiple locks, acquire them in a globally consistent order to avoid deadlock.
-  \item Use try-locks (\texttt{omp\_test\_lock}) with backoff/yield to implement opportunistic locking.
-  \item Profile and measure: locks can be performance anti-patterns when misused.
-\end{enumerate}
-
-\section{Transcription evaluation rubric (transcriptionEval)}
-This rubric is a suggested policy for grading lecture transcriptions. Each transcription will be graded on multiple axes. Scores for each axis are weighted and combined to produce a final score out of 100.
-
-\subsection*{Criteria and weights}
-\begin{tabular}{@{}lrr@{}}
-\toprule
-Criterion & Weight (\%) & Description \\
-\midrule
-Accuracy of words & 35 & Word-level correctness; measured as (1 - WER) where WER = word error rate \\
-Completeness & 15 & Coverage of all salient points/slide-text/code examples \\
-Timing & 10 & Timestamps correctness and alignment to audio (if required) \\
-Formatting \& LaTeX compliance & 10 & Proper \LaTeX{} formatting and escaping of special chars \\
-Speaker attribution & 5 & Correct speaker labels (if multiple speakers) \\
-Punctuation \& readability & 10 & Proper punctuation, sentence boundaries, capitalization \\
-Code fidelity & 10 & Code blocks preserved verbatim; no accidental token changes \\
-Confidence metadata & 5 & Annotations for low-confidence segments (optional but rewarded) \\
-\midrule
-Total & 100 & \\
-\bottomrule
-\end{tabular}
-
-\subsection*{Scoring guidance}
-\begin{itemize}
-  \item \textbf{Accuracy (35\%):} Compute WER between the transcription and a human-verified reference. Convert to points: score = 35 * (1 - WER). For example, WER=0.10 (10\%) $\rightarrow$ score = 31.5/35.
-  \item \textbf{Completeness (15\%):} Check that slides' bullet points, code examples, and main headings are present. Missing a slide's main bullet is a deduction of 3--6 points depending on importance.
-  \item \textbf{Timing (10\%):} If timestamps are required, verify start/end times align within a tolerance (e.g., $\pm$1 second for short utterances, $\pm$5 seconds for long ones).
-  \item \textbf{Formatting \& LaTeX (10\%):} The \LaTeX{} used must compile (or compile after minimal escaping). Special characters (\%, \_, \&, \$, \#, \{, \}) must be escaped. Code blocks should be in \texttt{verbatim} or \texttt{listings}.
-  \item \textbf{Speaker attribution (5\%):} If multiple speakers exist, labels should be consistent (e.g., ``Lecturer:'', ``Student:'').
-  \item \textbf{Punctuation \& readability (10\%):} Correct placement of commas, periods, and sentence structure. Improves usability.
-  \item \textbf{Code fidelity (10\%):} All code tokens (symbols, operators) must be preserved. Minor whitespace differences are acceptable but tokens must match.
-  \item \textbf{Confidence metadata (5\%):} Mark low-confidence words/phrases in the transcript (e.g., using \texttt{[? ... ]}) so reviewers can focus on verification.
-\end{itemize}
-
-\subsection*{Pass / Fail thresholds (suggested)}
-\begin{itemize}
-  \item \textbf{A (Excellent):} Final score $\ge$ 90.
-  \item \textbf{B (Good):} 75--89.
-  \item \textbf{C (Acceptable):} 60--74.
-  \item \textbf{D (Poor):} 50--59.
-  \item \textbf{F (Fail):} $<$ 50. Transcripts failing must be revised.
-\end{itemize}
-
-\subsection*{Automated checks}
-For large-scale evaluation, implement automated checks:
-\begin{enumerate}
-  \item Compute WER using standard library (e.g., \texttt{jiwer} in Python).
-  \item Check presence of expected bullet strings (exact or fuzzy match).
-  \item Validate LaTeX compile of the submitted \texttt{.tex} (silently) and capture errors.
-  \item Verify code-block token equality using normalized whitespace-insensitive diff.
-\end{enumerate}
+\section{Key Takeaway}
+Locks help achieve \textbf{race-freedom} (specifically, freedom from data races) when accessing a critical region. They enforce \textbf{mutual exclusion} among competing threads without introducing implicit synchronization barriers.
 
 \section{Exercises}
 \begin{enumerate}[label=\textbf{Exercise \arabic*:}]
-  \item \textbf{(Implementation)} Implement the simple counter example shown earlier, compile with \texttt{-fopenmp} and measure runtime for increasing thread counts. Replace locks with \texttt{atomic} and compare throughput. Report results with a short analysis.
-  \item \textbf{(Deadlock detection)} Given the code below, identify whether it can deadlock; if so propose a fix.
-\begin{lstlisting}[language=C]
-omp_lock_t A, B;
-omp_init_lock(&A); omp_init_lock(&B);
-
-#pragma omp parallel num_threads(2)
-{
-  if (omp_get_thread_num() == 0) {
-    omp_set_lock(&A);
-    // do work
-    omp_set_lock(&B); // potential deadlock
-    omp_unset_lock(&B);
-    omp_unset_lock(&A);
-  } else {
-    omp_set_lock(&B);
-    // do work
-    omp_set_lock(&A);
-    omp_unset_lock(&A);
-    omp_unset_lock(&B);
-  }
-}
-\end{lstlisting}
-  \item \textbf{(Transcription task)} Convert the slide content (provided at the head of this document) into a well-formed \LaTeX{} slide or handout. Ensure code blocks compile and special characters are escaped. Then evaluate your transcript against the rubric above and provide the computed score.
-  \item \textbf{(Nested locks)} Write a short program that demonstrates nestable lock behavior by acquiring the same nest lock multiple times from the same thread and showing the recursion count (use explanatory prints).
+  \item Explain why \texttt{omp\_single} cannot replace locks when all threads must eventually execute a critical region.
+  \item Write a small OpenMP program where threads increment a shared counter:
+  \begin{itemize}
+    \item First without locks (observe incorrect result),
+    \item Then using \texttt{omp\_lock\_t}.
+  \end{itemize}
+  \item Consider a lock that is unfair. Explain how starvation may arise with a looped critical region.
+  \item Classify the following as race condition, data race, both, or neither, and justify your answer.
 \end{enumerate}
 
-\section{Sample answers / hints}
-\begin{itemize}
-  \item Exercise 2 (deadlock): Yes, the code can deadlock because thread 0 holds \texttt{A} while waiting for \texttt{B}, and thread 1 holds \texttt{B} while waiting for \texttt{A}. Fix by acquiring locks in consistent order (both threads acquire \texttt{A} then \texttt{B}), or use try-lock with timeout and back off.
-  \item Exercise 1 (atomic vs lock): For simple increments, \texttt{atomic} will normally outperform lock-based critical sections because it avoids heavyweight blocking and context switches.
-\end{itemize}
-
-\section{Illustration}
-\begin{figure}[h]
-  \centering
-  \includegraphics[width=0.9\linewidth]{eec44233-0fb7-451a-8763-d77b9c3f5a5f.png}
-  \caption{Lecture slide: ``Other Synchronisations: Locks''. Provided as visual reference.}
-\end{figure}
-
-\section{Appendix: Quick reference}
-\begin{itemize}
-  \item \texttt{omp\_init\_lock, omp\_destroy\_lock}
-  \item \texttt{omp\_set\_lock, omp\_unset\_lock}
-  \item \texttt{omp\_test\_lock}
-  \item Nestable variants: \texttt{omp\_init\_nest\_lock, omp\_set\_nest\_lock, omp\_unset\_nest\_lock, omp\_test\_nest\_lock, omp\_destroy\_nest\_lock}
-  \item Use \texttt{\#pragma omp critical} for simple cases and \texttt{atomic} for single memory updates.
-\end{itemize}
+\section{Summary}
+This lecture segment introduced locks as a foundational synchronization primitive. Locks provide a controlled way to serialize execution in parallel programs, prevent data races, and expose low-level synchronization control to the programmer. They differ fundamentally from OpenMP directives such as \texttt{single} and are essential for writing correct shared-memory parallel code.
 
 \end{document}
