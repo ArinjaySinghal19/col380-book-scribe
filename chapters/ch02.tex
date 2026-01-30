@@ -7,3 +7,219 @@ Introduce key abstractions and how they affect correctness and performance.
 A model is a promise about what is cheap vs expensive: memory access, communication,
 synchronization, and scheduling.
 \end{ppkey}
+
+\section{Other synchronizations: locks}
+
+Locks are synchronization primitives that help achieve \emph{orderly} access to a
+shared resource by enforcing \emph{mutual exclusion}. Conceptually, a lock protects
+some critical region~$C$ in the program: among all threads that wish to execute
+this region, at most one thread is allowed to execute~$C$ at a time.
+
+It is important to distinguish this from the semantics of
+\verb|#pragma omp single|. Under \texttt{single}, the associated region is
+executed by exactly one \emph{arbitrary} thread in the team, and all other
+threads will \emph{never} execute that region. In contrast, a locked region is
+typically intended to be executed \emph{once by every competing thread}, but in
+an orderly, serialized fashion: threads "take turns" executing the same region
+while preserving mutual exclusion.
+
+\subsection{A simple mental model of a lock}
+
+To reason about locks, it is useful to introduce an explicit lock variable~$V$.
+This is a shared memory location that acts as a \emph{guard} for a critical
+region~$C$.
+
+\begin{itemize}
+	\item $V$ is a shared variable, visible to all threads.
+	\item By convention, $V = 0$ denotes that the lock is \emph{available}
+				(unlocked) and $V = 1$ denotes that the lock is \emph{held}
+				(locked).
+	\item A thread that successfully changes $V$ from $0$ to $1$ is said to
+				have \emph{acquired} the lock and is allowed to enter~$C$.
+	\item When the thread leaves~$C$, it \emph{releases} the lock by setting
+				$V$ back to $0$.
+\end{itemize}
+
+All threads that wish to execute~$C$ first compete to acquire the lock
+associated with~$V$. A simple --- but realistic --- way to imagine this is as a
+spin lock that continuously polls the value of~$V$ in memory:
+
+\begin{lstlisting}[language=OpenMP,caption={Naive spin lock using a shared guard variable $V$},label={prog:spin-lock-V}]
+/* shared variable, initially 0 (unlocked) */
+int V = 0;
+
+void lock() {
+	/* busy-wait until the lock appears free */
+	while (V == 1) {
+		/* spin: repeatedly read V from memory */
+	}
+	/* request to acquire the lock */
+	V = 1;
+}
+
+void unlock() {
+	V = 0;  /* release the lock */
+}
+
+void critical_region_C() {
+	lock();
+	/* code in C: only one thread executes this at a time */
+	unlock();
+}
+\end{lstlisting}
+
+The above pseudocode is \emph{not} a correct implementation on real hardware
+because the read--modify--write on $V$ must itself be atomic, but it captures
+the \emph{semantics} of what a lock is trying to achieve:
+
+\begin{ppkey}
+Locks provide mutual exclusion: at most one thread executes the protected
+critical region~$C$ at any given time, even though many threads may want to
+execute~$C$ in parallel.
+\end{ppkey}
+
+Internally, threads that are waiting for the lock to become free repeatedly
+\emph{poll} the shared variable~$V$. At the hardware level, this results in a
+sequence of read requests for the cache line that stores~$V$ over the memory
+bus. In a naive implementation, each polling thread would take turns acquiring
+the bus to issue its read request. Modern multiprocessors optimize this, and
+many cores may observe the updated value of~$V$ more or less simultaneously,
+but the conceptual picture of multiple threads continuously checking~$V$ still
+applies. This behaviour is often called a \emph{spin loop} or \emph{busy
+waiting}.
+
+\subsection{Comparison with sequential execution}
+
+A natural question is: if there are $n$ threads and each one must execute
+the same region~$C$ under a lock, is this any different from simply executing
+the $n$ copies of~$C$ sequentially in a single thread? Semantically, the effect
+on shared variables inside~$C$ is similar: only one copy of~$C$ runs at a
+time. The key difference is that locks allow the programmer to embed this
+sequentialization \emph{locally} within an otherwise parallel computation.
+
+Outside~$C$, threads can still make progress in parallel, and multiple locks or
+other synchronization constructs can coexist. Locks therefore give the
+programmer fine-grained control over where to serialize execution in an
+otherwise parallel program.
+
+If the goal is to have exactly one thread in the team execute~$C$ and the
+others never execute it, then a \verb|#pragma omp single| region is the right
+abstraction. If, instead, the goal is that \emph{every} competing thread should
+eventually execute~$C$, but with mutual exclusion, then a lock is the
+appropriate tool.
+
+\subsection{Race conditions, data races, and starvation}
+
+The terminology around races can be confusing, so we fix the following
+distinction:
+
+\begin{itemize}
+	\item A \emph{race condition} is a situation in which multiple threads
+				concurrently express an interest in acquiring some resource (for
+				example, a lock or some other shared object), and the outcome depends
+				on the relative timing of their requests.
+	\item A \emph{data race} is a low-level event on a shared memory location in
+				which at least one access is a write and the accesses are not ordered
+				by the happens-before relation provided by the programming model
+				(i.e., they are unsynchronized and can overlap).
+\end{itemize}
+
+Race conditions at the level of resources are sometimes \emph{desirable}: we
+want threads to compete for the lock so that one of them can proceed. In
+contrast, data races on ordinary shared variables are almost always a bug.
+
+Correctly implemented locks are designed to \emph{prevent data races inside the
+protected region}. Since at most one thread can execute~$C$ at a time, two
+threads can never concurrently read and write or write and write the same
+variable \emph{inside}~$C$ without additional synchronization.
+
+However, lock-based programs can still suffer from \emph{starvation}. Suppose
+the lock is repeatedly acquired and released in a loop. It is possible (in an
+unfair implementation) that the same thread repeatedly acquires the lock,
+while some other thread that is also trying to acquire it is perpetually
+postponed. Designing synchronization primitives that are both efficient and
+fair is an active area of research at the interface of operating systems,
+architecture, and programming languages.
+
+\begin{pppitfall}
+The lock variable itself (the guard $V$) should never be modified directly by
+user code outside the lock implementation. For example, directly assigning to
+the underlying memory location for~$V$ in arbitrary code can break the mutual
+exclusion guarantees and lead to subtle bugs. Always acquire and release locks
+through the designated primitives.
+\end{pppitfall}
+
+\subsection{Polling and busy waiting}
+
+When a thread does not currently hold the lock but wishes to acquire it, it
+must discover when another thread has released it. In the simple spin-lock
+model, this is achieved by polling the guard variable~$V$ in a loop:
+
+\begin{lstlisting}[language=OpenMP,caption={Busy-waiting on a shared guard},label={prog:spin-loop-V}]
+/* shared variable V: 0 means unlocked, 1 means locked */
+while (V == 1) {
+	/* spin: repeatedly check whether V has become 0 */
+}
+
+/* attempt to acquire the lock when V appears free */
+V = 1;
+\end{lstlisting}
+
+At the machine level, each iteration issues a read request for~$V$'s memory
+location over the interconnect (bus or cache-coherence network). When the
+current lock holder executes \verb|unlock()| and writes $V = 0$, all polling
+threads will eventually observe this new value and contend to acquire the lock
+again. The runtime or hardware effectively serializes these acquisition
+attempts so that exactly one thread succeeds in changing~$V$ back to~$1$.
+
+\subsection{OpenMP lock primitives}
+
+OpenMP exposes lock-based synchronization through a small set of primitives.
+These are defined in \texttt{omp.h} and operate on variables of type
+\texttt{omp\_lock\_t} (for ordinary locks) or \texttt{omp\_nest\_lock\_t} (for
+nestable, or re-entrant, locks).
+
+The basic operations are:
+
+\begin{itemize}
+	\item \verb|omp_init_lock(omp_lock_t *lock)| initializes a simple lock.
+	\item Nestable locks are declared with type \verb|omp_nest_lock_t|.
+	\item \verb|omp_set_lock(omp_lock_t *lock)| acquires the lock, blocking until
+				it becomes available.
+	\item \verb|omp_unset_lock(omp_lock_t *lock)| releases a previously acquired
+				lock.
+	\item \verb|omp_destroy_lock(omp_lock_t *lock)| destroys the lock and frees
+				any associated resources.
+	\item \verb|omp_test_lock(omp_lock_t *lock)| attempts to acquire the lock
+				\emph{without blocking}. It sets the lock if it is currently available
+				and returns a non-zero value. If the lock is already held by some
+				thread, it leaves the lock unchanged and returns zero.
+\end{itemize}
+
+The non-blocking behaviour of \verb|omp_test_lock| makes it suitable for
+implementing explicit busy-wait loops that periodically try to acquire a lock
+while optionally doing other work. A canonical pattern is:
+
+\begin{lstlisting}[language=OpenMP,caption={Busy-waiting using \texttt{omp_test_lock}},label={prog:omp-test-lock}]
+omp_lock_t L;
+int flag = 0;
+
+omp_init_lock(&L);
+
+while (!flag) {
+	flag = omp_test_lock(&L);  /* try to acquire L without blocking */
+}
+
+/* critical region protected by L */
+/* ... work on shared data ... */
+
+omp_unset_lock(&L);
+omp_destroy_lock(&L);
+\end{lstlisting}
+
+This pattern mirrors the abstract spin loop over~$V$ described earlier, but
+delegates the low-level details of atomicity, memory ordering, and fairness to
+the OpenMP runtime and the underlying hardware. The key takeaway is that locks
+help in achieving race freedom --- in particular, data-race freedom --- when
+accessing a critical region that many competing threads wish to execute
+simultaneously.
