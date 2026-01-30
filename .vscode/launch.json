@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/arinjaysinghal/Desktop/col380-book-scribe",
+      "program": "/Users/arinjaysinghal/Desktop/col380-book-scribe/build/Debug/outDebug"
+    }
+  ]
+}

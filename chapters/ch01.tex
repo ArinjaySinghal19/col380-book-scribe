@@ -1,48 +1,245 @@
-\chapter{Introduction}
+\chapter{Thread Control Flow and Synchronization}
+\label{ch:thread-control}
 
-\section{Why parallel programming?}
-Parallel hardware is everywhere. Parallel programming is about expressing
-concurrency safely and efficiently.
+This chapter delves deeper into additional OpenMP primitives, starting with \emph{thread-specific control flow}\index{control flow!thread-specific}: situations where some threads execute a piece of code while others do not. We will use the OpenMP thread identifier \texttt{tid} (returned by \texttt{omp\_get\_thread\_num()}\index{omp\_get\_thread\_num()}) and a shared variable \texttt{numt} to store the number of threads in the current parallel region (returned by \texttt{omp\_get\_num\_threads()}\index{omp\_get\_num\_threads()}).
 
 \begin{ppnote}
-A recurring theme: performance is a \emph{tradeoff} between work, critical path,
-and overheads (communication, synchronization, scheduling).
+\textbf{Prerequisites:} This chapter assumes familiarity with basic OpenMP parallel regions (\texttt{\#pragma omp parallel}). All code examples can be compiled with:
+\begin{verbatim}
+gcc -fopenmp program.c -o program
+\end{verbatim}
 \end{ppnote}
 
-\section{A first OpenMP program}
+\section{Thread-Specific Control Flow via Conditionals}
 
 \begin{ppexample}
-We begin with a simple data-parallel loop and then reason about correctness and speedup.
+Consider a parallel region where only one thread should initialize a shared variable.
 \end{ppexample}
 
-\begin{ppprogram}{OpenMP reduction for summation}{prog:omp-sum}
+\begin{ppprogram}{Naive thread-specific control flow using a conditional}{prog:tid-conditional}
 \begin{lstlisting}[language=OpenMP]
 #include <omp.h>
 #include <stdio.h>
 
-int main() {
-  const int n = 1000000;
-  double sum = 0.0;
+int main(void) {
+    int numt, tid;
 
-  #pragma omp parallel for reduction(+:sum)
-  for (int i = 1; i <= n; i++) sum += 1.0 / i;
+    #pragma omp parallel private(tid)
+    {
+        tid = omp_get_thread_num();
 
-  printf("sum = %.12f\n", sum);
-  return 0;
+        if (tid == 0)
+            numt = omp_get_num_threads();
+    }
+
+    return 0;
 }
 \end{lstlisting}
 \end{ppprogram}
 
+The value of \texttt{numt} denotes the number of threads in the \emph{current} OpenMP team. For a given parallel region, this value is fixed for the lifetime of that region, so it is wasteful (and also incorrect) to have every thread redundantly write it. In Program~\ref{prog:tid-conditional}, we avoid redundant writes by allowing only a particular thread (here, \texttt{tid==0}) to assign \texttt{numt}.
+
+\begin{ppdefn}
+\ppterm{Control divergence}\index{control divergence} occurs when not all threads execute the same control path. One thread may perform a setup-like task (e.g., recording the team size), while other threads skip that work. This is an early glimpse of task-based parallelism: different threads may perform different roles even within the same parallel region.
+\end{ppdefn}
+
+\begin{figure}[h]
+    \centering
+    \fbox{\parbox{0.75\textwidth}{\centering
+    \textbf{[Figure: Control Divergence Illustration]}\\[0.5em]
+    A diagram showing multiple threads (T0, T1, T2, T3) where T0 takes a different branch (executes the if-block) while T1--T3 skip it. Arrows indicate the divergent control paths rejoining after the conditional.}}
+    \caption{Control divergence: Thread~0 executes the conditional block while other threads skip it.}
+    \label{fig:control-divergence}
+\end{figure}
+
 \begin{pppitfall}
-Do not assume a reduction fixes all correctness issues: shared data structures,
-I/O, and non-associative floating-point operations can still surprise you.
+While Program~\ref{prog:tid-conditional} is fine as a \emph{pattern} for ``only one thread should write this shared variable,'' it does \emph{not} by itself guarantee that other threads will see the initialized value at the point they use it. If other threads read \texttt{numt} immediately afterwards, explicit synchronization is required.
 \end{pppitfall}
 
-\section{Exercises}
-\begin{ppexercises}
-  \ppexercise{Modify Program~\ref{prog:omp-sum} to use \ppinline{schedule(static)}
-  and \ppinline{schedule(dynamic)}. Measure runtimes and explain the difference.}
+\section{The \texttt{single} Directive}
+\label{sec:single-directive}
+\index{single directive@\texttt{single} directive}
 
-  \ppexercise{Explain why summation order affects floating-point results. Suggest
-  a mitigation strategy.}
+This raises a natural question: \emph{Given a parallel region, can we ask OpenMP to execute a region using only a single thread?}
+
+Yes. OpenMP provides \texttt{\#pragma omp single}~\cite{openmp-spec}. Exactly one thread in the team (not predetermined; chosen by the runtime) executes the associated block. By default, \texttt{single} also introduces an \emph{implicit barrier}\index{barrier!implicit} at the end of the block, meaning that all other threads wait until the single thread finishes that block.
+
+\begin{figure}[h]
+    \centering
+    \fbox{\parbox{0.75\textwidth}{\centering
+    \textbf{[Figure: \texttt{single} Directive Execution]}\\[0.5em]
+    Timeline showing threads T0--T3. One thread (chosen by runtime) executes the single block while others wait at the implicit barrier. After the block completes, all threads proceed together.}}
+    \caption{The \texttt{single} directive with implicit barrier synchronization.}
+    \label{fig:single-directive}
+\end{figure}
+
+\begin{ppprogram}{\texttt{omp single} with implicit barrier}{prog:omp-single}
+\begin{lstlisting}[language=OpenMP]
+#pragma omp single
+{
+    numt = omp_get_num_threads();
+}  /* implicit barrier here */
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppkey}
+\textbf{How is \texttt{single} different from a conditional?}
+\begin{itemize}
+    \item \textbf{Work assignment:} \texttt{single} allows any available thread in the team to execute the block; a conditional fixes responsibility to a specific thread ID (often \texttt{tid==0}). If thread~0 is busy, the conditional approach can delay progress unnecessarily.
+    \item \textbf{Synchronization:} \texttt{single} has an implicit barrier by default, which makes it a safe ``initialize-once'' mechanism when other threads need the results immediately after the block. A conditional does \emph{not} automatically synchronize.
+\end{itemize}
+\end{ppkey}
+
+\subsection{The \texttt{nowait} Clause}
+
+Sometimes you want \texttt{single} to perform work by one thread \emph{without forcing all other threads to wait immediately}. For that, OpenMP provides \texttt{nowait}, which removes the implicit barrier at the end of the \texttt{single} block:
+
+\begin{ppprogram}{\texttt{omp single nowait} (no implicit barrier)}{prog:omp-single-nowait}
+\begin{lstlisting}[language=OpenMP]
+#pragma omp single nowait
+{
+    numt = omp_get_num_threads();
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppnote}
+\texttt{nowait} is safe only when no other thread requires the results of the \texttt{single} block immediately after it. If they do, you must introduce synchronization later (e.g., an explicit \texttt{barrier} or a different dependency structure).
+\end{ppnote}
+
+The \texttt{single} directive must appear \emph{inside} an OpenMP parallel region; outside a parallel region it has no useful semantics (there is no thread team from which to choose a single executor).
+
+\section{The \texttt{master} Directive}
+\label{sec:master-directive}
+\index{master directive@\texttt{master} directive}
+
+There is another way to force \emph{the master thread} (thread~0 of the team) to execute a region: \texttt{\#pragma omp master}.
+
+\begin{ppdefn}
+In an OpenMP parallel region, each thread has a thread ID in $\{0, 1, \dots, \texttt{numt}-1\}$. The thread with \texttt{tid==0} is referred to as the \ppterm{master thread}\index{master thread} of that team.
+\end{ppdefn}
+
+\begin{ppnote}
+\textbf{Deprecation notice:} As of OpenMP~5.1, the \texttt{master} directive is deprecated in favor of \texttt{masked}. However, \texttt{master} remains widely used in existing codebases~\cite{openmp-spec}.
+\end{ppnote}
+
+\begin{ppkey}
+Unlike \texttt{single}, the \texttt{master} directive has \emph{no implicit barrier} at the end. This is ideal when other threads should continue working without waiting.
+\end{ppkey}
+
+\subsection{Comparing Control Flow Mechanisms}
+
+\begin{ppnote}
+\textbf{When to use each mechanism:}
+\begin{itemize}
+    \item \textbf{Conditional (\texttt{if (tid==0)}):} Quick-and-dirty thread-specific control flow when you want a fixed thread to do a small action (e.g., update a counter, print a header). You must manage synchronization yourself if others depend on the result.
+    \item \textbf{\texttt{single}:} One-time initialization or one-time computation inside a parallel region where \emph{any} thread may do it, and where the implicit barrier is desirable for correctness (or \texttt{nowait} when you do not want to stall the team).
+    \item \textbf{\texttt{master}:} Operations that must be executed by the master thread specifically (e.g., interacting with a master-only API, coordinating I/O policies, or maintaining a single ``coordinator'' role). Since there is no implicit barrier, it is ideal when other threads should continue working without waiting.
+\end{itemize}
+\end{ppnote}
+
+\begin{ppexample}
+\ppemph{MapReduce analogy.} In distributed systems such as MapReduce, one often describes a \emph{master/coordinator} that schedules work for many \emph{workers}. OpenMP is shared-memory threading (not distributed), but the intuition can still help: using \texttt{master} lets thread~0 act as a coordinator while other threads proceed. The key difference is that in OpenMP the ``master'' is simply \texttt{tid==0} within a thread team, not a separate process.
+\end{ppexample}
+
+\begin{ppnote}
+\textbf{Question:} When we define the number of threads as 4, does that mean there are 4 worker threads and 1 main thread, or 4 threads including the master thread?
+
+\textbf{Answer:} It is the second option: 4 threads total in the team \emph{including} the master thread (\texttt{tid==0}). Thread IDs will be $0, 1, 2, 3$.
+\end{ppnote}
+
+\section{Explicit Synchronization with Barriers}
+\label{sec:barriers}
+\index{barrier!explicit}
+
+Now suppose we want to add synchronization to the conditional approach so that all threads use \texttt{numt} only after it has been set. This connects directly to the concepts of mutual exclusion and atomicity discussed in Chapter~\ref{ch:mutual-exclusion}.
+
+\begin{ppdefn}
+An OpenMP \ppterm{barrier}\index{barrier} is a \emph{team-wide synchronization point}. Every thread in the team must arrive at the barrier before any thread is allowed to proceed past it. In addition, a barrier implies a memory consistency action (a ``flush''\index{flush} of shared variables) so that writes performed before the barrier become visible to reads after the barrier.
+\end{ppdefn}
+
+\begin{figure}[h]
+    \centering
+    \fbox{\parbox{0.75\textwidth}{\centering
+    \textbf{[Figure: Barrier Synchronization]}\\[0.5em]
+    Timeline showing threads T0--T3 arriving at a barrier at different times. Dashed vertical line represents the barrier. All threads wait until the last thread arrives, then all proceed simultaneously.}}
+    \caption{Barrier semantics: threads wait until all have arrived.}
+    \label{fig:barrier-sync}
+\end{figure}
+
+OpenMP provides the directive \texttt{\#pragma omp barrier} for this purpose.
+
+\begin{ppprogram}{Conditional control flow with explicit barrier}{prog:barrier-sync}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+#include <stdio.h>
+
+int main(void) {
+    int numt, tid;
+
+    #pragma omp parallel shared(numt) private(tid)
+    {
+        tid = omp_get_thread_num();
+
+        if (tid == 0)
+            numt = omp_get_num_threads();
+
+        #pragma omp barrier
+
+        // All threads wait here until thread 0 has set numt
+        // Now all threads can safely use numt
+        printf("hello world %d of %d\n", tid, numt);
+    }
+
+    return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppnote}
+\textbf{Question:} Is Program~\ref{prog:barrier-sync} equivalent to \texttt{\#pragma omp master}?
+
+\textbf{Answer:} No. It is best understood as \texttt{master}-like behavior \emph{plus explicit synchronization}. The assignment \texttt{if (tid==0) numt = ...} matches the ``executed by master only'' idea, but the \texttt{barrier} is \emph{not} part of \texttt{master} semantics. In fact, Program~\ref{prog:barrier-sync} is essentially: ``do the assignment on the master thread, then force the whole team to wait until the master is done, then continue.''
+\end{ppnote}
+
+\subsection{Barrier Behavior Analysis}
+
+\begin{ppkey}
+\textbf{With the barrier:} All threads are guaranteed to print using the initialized value of \texttt{numt}. If the team size is 4, you will see four lines, one per thread, and each line will have \texttt{of 4}. The \emph{order is not guaranteed} (threads may print in any order), but typical output will look like:
+\begin{verbatim}
+hello world 0 of 4
+hello world 2 of 4
+hello world 1 of 4
+hello world 3 of 4
+\end{verbatim}
+\end{ppkey}
+
+\begin{pppitfall}
+\textbf{Without the barrier:} If you remove the \texttt{\#pragma omp barrier}, the program contains a race between the master thread writing \texttt{numt} and other threads reading \texttt{numt} for printing. Some threads may print before \texttt{numt} is initialized, so \texttt{numt} may appear as an uninitialized (garbage) value or an unexpected number. This is a classic pitfall: ``only one thread writes'' is not sufficient for correctness unless readers are synchronized with the writer.
+\end{pppitfall}
+
+\section{Summary}
+
+This chapter introduced three mechanisms for thread-specific control flow in OpenMP:
+\begin{itemize}
+    \item \textbf{Conditionals} (e.g., \texttt{if (tid==0)}) for quick, targeted control flow---requires manual synchronization.
+    \item \textbf{\texttt{single}} for one-time execution by any thread, with implicit barrier.
+    \item \textbf{\texttt{master}} for execution specifically by thread~0, without implicit barrier.
+\end{itemize}
+Barriers provide explicit synchronization to ensure all threads reach a common point before proceeding. The next chapter explores how these synchronization concepts relate to mutual exclusion and atomicity.
+
+\section{Exercises}
+
+\begin{ppexercises}
+  \ppexercise{Modify Program~\ref{prog:barrier-sync} to use \texttt{\#pragma omp single} instead of the conditional. Compare the behavior with and without \texttt{nowait}.}
+  
+  \ppexercise{Explain why using \texttt{\#pragma omp master} without an explicit barrier can lead to incorrect results when other threads depend on values set by the master.}
+  
+  \ppexercise{Write a program that demonstrates the difference between \texttt{single} and \texttt{master} by timing how long the parallel region takes with each approach. Use \texttt{omp\_get\_wtime()} for measurements.}
+  
+  \ppexercise{Consider a parallel region with 8 threads. Draw a timeline diagram showing what happens when thread~3 reaches a barrier before the other threads. Label when each thread arrives and when all threads are released.}
 \end{ppexercises}
+
+\section*{References}
+\addcontentsline{toc}{section}{References}
+See the OpenMP Specification~\cite{openmp-spec} for authoritative documentation on all directives discussed in this chapter.

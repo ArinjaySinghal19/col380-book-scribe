@@ -116,7 +116,7 @@ The \texttt{single} directive must appear \emph{inside} an OpenMP parallel regio
 There is another way to force \emph{the master thread} (thread 0 of the team) to execute a region: \texttt{\#pragma omp master}.
 
 \begin{itemize}
-    \item \textbf{Who executes the block?} Always \texttt{tid==0} специалистов (the master thread).
+    % \item \textbf{Who executes the block?} Always \texttt{tid==0} специалистов (the master thread).
     \item \textbf{Barrier semantics:} Unlike \texttt{single}, \texttt{master} has \emph{no implicit barrier} at the end.
 \end{itemize}
 

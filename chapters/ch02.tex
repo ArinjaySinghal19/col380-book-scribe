@@ -1,9 +1,263 @@
-\chapter{Parallel Models and Costs}
+\chapter{Mutual Exclusion and Atomicity}
+\label{ch:mutual-exclusion}
+\index{mutual exclusion}\index{atomicity}
 
-\section{Shared vs distributed memory}
-Introduce key abstractions and how they affect correctness and performance.
+This chapter explores the critical distinction between mutual exclusion and atomicity---two fundamental concepts in parallel programming that are often conflated but represent distinct guarantees. Understanding this distinction is essential for writing correct concurrent code, building on the synchronization primitives introduced in Chapter~\ref{ch:thread-control}.
+
+\section{What is Mutual Exclusion?}
+
+\begin{ppdefn}
+\ppterm{Mutual exclusion}\index{mutual exclusion!definition} ensures that only one thread at a time executes a designated \ppterm{critical section}\index{critical section}. Programmers typically use a \ppterm{lock}\index{lock}/\ppterm{unlock} protocol to serialize access among threads that compete to run the same code region. See Chapter~\ref{ch:locks} for detailed coverage of OpenMP lock primitives.
+\end{ppdefn}
+
+Suppose there are $n$ threads competing to execute code region~$C$. Using a lock, the programmer sequentializes access so that a single thread executes the critical section while the others wait.
+
+\begin{figure}[h]
+    \centering
+    \fbox{\parbox{0.7\textwidth}{\centering 
+    \textbf{Mutual Exclusion Diagram}\\[0.5em]
+    A critical code region is guarded by a lock. Thread $T_0$ acquires lock \texttt{v} and enters the region; threads $T_1$ and $T_2$ wait. Waiting threads spin (poll) on \texttt{v}. When $T_0$ exits, it releases \texttt{v}; then $T_1$ acquires it and enters, while the remaining threads continue to wait. In this way, execution of the critical section is serialized.}}
+    \caption{Mutual exclusion using locks}
+    \label{fig:mutual_exclusion}
+\end{figure}
+
+\section{Mutual Exclusion vs Atomicity}
+
+\begin{pppitfall}
+\textbf{Do not conflate \ppterm{mutual exclusion} with \ppterm{atomicity}.}
+\begin{itemize}
+    \item \textbf{Mutual exclusion:} Only one thread executes the critical section at a time; the running thread can still be preempted by the operating system.
+    \item \textbf{Atomicity:} A tagged sequence of instructions appears as a single, indivisible step to all observers---it cannot be interrupted or interleaved.
+\end{itemize}
+Neither property implies the other.
+\end{pppitfall}
 
 \begin{ppkey}
-A model is a promise about what is cheap vs expensive: memory access, communication,
-synchronization, and scheduling.
+Atomicity presents an indivisible view of a sequence of actions; mutual exclusion merely serializes entry into a region. They are related but distinct guarantees.
 \end{ppkey}
+
+\section{Atomicity Without Mutual Exclusion}
+
+\begin{ppexample}
+\ppemph{Atomicity without mutual exclusion.} The increment operation itself is atomic, but threads are not excluded from running concurrently---many threads can perform the atomic increment at the same time without lost updates.
+\end{ppexample}
+
+\begin{ppprogram}{OpenMP atomic increment (no mutual exclusion)}{prog:atomic-no-me}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+#include <stdio.h>
+
+int main() {
+    long long hits = 0;
+
+    #pragma omp parallel
+    {
+        // Many threads execute concurrently (no mutual exclusion),
+        // but each increment is atomic (no lost updates).
+        #pragma omp atomic
+        hits++;
+    }
+
+    printf("hits = %lld\n", hits);
+    return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+In this example, multiple threads can reach the \texttt{\#pragma omp atomic}\index{atomic directive@\texttt{atomic} directive} directive simultaneously. Each individual increment is atomic (no partial updates or lost writes), but the threads are not mutually excluded from executing concurrently.
+
+\begin{ppnote}
+\textbf{Hardware support:} The \texttt{atomic} directive typically compiles to hardware atomic instructions (e.g., \texttt{lock xadd} on x86). This is more efficient than acquiring a lock for simple operations like increment, decrement, or compare-and-swap.
+\end{ppnote}
+
+\section{Mutual Exclusion Without Atomicity}
+
+\begin{ppexample}
+\ppemph{Mutual exclusion without atomicity.} Each individual balance update is protected by a per-account lock (mutual exclusion holds per account), but the transfer as a whole is not atomic because the debit and credit occur in two separate locked regions. Other threads can observe intermediate state.
+\end{ppexample}
+
+\begin{ppprogram}{Per-account locks: transfer not atomic as a whole}{prog:me-no-atomic}
+\begin{lstlisting}[language=OpenMP]
+#include <omp.h>
+
+// Conceptual example
+extern omp_lock_t acct_lock[];
+extern long long balance[];
+
+// Transfer money from -> to (WRONG if atomic transfer is required)
+void transfer(int from, int to, long long amount) {
+    omp_set_lock(&acct_lock[from]);
+    balance[from] -= amount;   // debit
+    omp_unset_lock(&acct_lock[from]);
+
+    // Another thread can observe the debit before the credit happens.
+
+    omp_set_lock(&acct_lock[to]);
+    balance[to] += amount;     // credit
+    omp_unset_lock(&acct_lock[to]);
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{pppitfall}
+In Program~\ref{prog:me-no-atomic}, the invariant ``total money is conserved'' can appear violated to an observer who reads both accounts between the debit and credit. The individual operations have mutual exclusion, but the composite transfer lacks atomicity.
+\end{pppitfall}
+
+\section{Achieving Both: A Bank Transfer Example}
+\label{sec:bank-transfer}
+\index{bank transfer example}
+
+To make a transfer truly atomic (as well as mutually exclusive), we must hold locks on \emph{both} accounts for the duration of the entire operation. This example demonstrates the practical application of locks covered in Chapter~\ref{ch:locks}.
+
+\begin{ppnote}
+\textbf{Memory allocation note:} The code uses \texttt{calloc()}\index{calloc()} rather than \texttt{malloc()}. Both return a contiguous block of memory; the key difference is that \texttt{calloc} zero-initializes. Whether \texttt{calloc} is slower depends on the allocator/OS (zeroing may be optimized); do not assume performance characteristics without measurement.
+\end{ppnote}
+
+\begin{ppprogram}{Correct atomic transfer using a global lock}{prog:atomic-transfer}
+\begin{lstlisting}[language=OpenMP]
+#include <stdio.h>
+#include <stdlib.h>
+#include <omp.h>
+
+int main() {
+    const int N_ACCTS = 8;
+    const int N_TXNS = 2000000;
+
+    long long *balance = (long long *)calloc(N_ACCTS, sizeof(long long));
+    if (!balance) return 1;
+
+    // Initialize all accounts
+    for (int i = 0; i < N_ACCTS; i++) {
+        balance[i] = 1000;
+    }
+
+    omp_lock_t ledger_lock;
+    omp_init_lock(&ledger_lock);
+
+    double t0 = omp_get_wtime();
+
+    #pragma omp parallel
+    {
+        unsigned int seed = (unsigned int)omp_get_thread_num();
+
+        #pragma omp for schedule(static)
+        for (int k = 0; k < N_TXNS; k++) {
+            int from = (int)(rand_r(&seed) % N_ACCTS);
+            int to = (int)(rand_r(&seed) % N_ACCTS);
+            if (from == to) continue;
+
+            long long amount = (long long)(rand_r(&seed) % 5);
+
+            // Critical section via an explicit lock
+            omp_set_lock(&ledger_lock);
+
+            balance[from] -= amount;
+            balance[to] += amount;
+
+            omp_unset_lock(&ledger_lock);
+        }
+    }
+
+    double t1 = omp_get_wtime();
+
+    omp_destroy_lock(&ledger_lock);
+
+    // Check conservation invariant
+    long long total = 0;
+    for (int i = 0; i < N_ACCTS; i++)
+        total += balance[i];
+
+    printf("Initial total = %lld\n", N_ACCTS * 1000LL);
+    printf("Final total   = %lld\n", total);
+    printf("Elapsed time  = %f seconds\n", t1 - t0);
+
+    free(balance);
+    return 0;
+}
+\end{lstlisting}
+\end{ppprogram}
+
+\begin{ppnote}
+\textbf{Key observations from this example:}
+\begin{itemize}
+    \item The example models concurrent access to shared state: multiple threads perform ``transfers'' between bank accounts.
+    \item Without synchronization, updates to shared balances can interleave unpredictably, producing non-deterministic results.
+    \item Each transfer conceptually performs a read--modify--write on two shared memory locations: \texttt{balance[from]} and \texttt{balance[to]}.
+    \item A data race occurs when two threads access the same location concurrently and at least one access is a write, with no ordering enforced.
+\end{itemize}
+\end{ppnote}
+
+\begin{ppkey}
+\textbf{Correctness specification (invariants and post-condition):}
+\begin{itemize}
+    \item Desired invariant: the sum of all balances should remain constant (``conservation of money'').
+    \item Each valid transfer subtracts \texttt{amount} from one account and adds the same \texttt{amount} to another.
+    \item If every transfer is applied atomically as a pair, then total money is preserved.
+\end{itemize}
+\end{ppkey}
+
+\section{Performance Considerations}
+\label{sec:perf-considerations}
+\index{lock contention}\index{Amdahl's Law}
+
+\begin{pppitfall}
+\textbf{What the lock guarantees (and what it costs):}
+\begin{itemize}
+    \item \textbf{Correctness:} Prevents lost updates and makes the invariant check meaningful.
+    \item \textbf{Performance:} If every iteration takes the same global lock, the parallel loop becomes effectively serialized.
+\end{itemize}
+This is an instance of \emph{lock contention} and \emph{Amdahl's Law}: a large serialized fraction limits speedup.
+\end{pppitfall}
+
+\begin{figure}[h]
+    \centering
+    \fbox{\parbox{0.75\textwidth}{\centering
+    \textbf{[Figure: Lock Contention and Scalability]}\\[0.5em]
+    Graph showing speedup vs.\ number of threads. Ideal linear speedup (dashed line) compared to actual speedup with global lock (nearly flat line approaching 1). Illustrates how a serialized critical section limits parallel efficiency.}}
+    \caption{Lock contention limits parallel speedup as predicted by Amdahl's Law.}
+    \label{fig:lock-contention}
+\end{figure}
+
+\begin{ppkey}
+\textbf{Theory-first takeaway:}
+\begin{itemize}
+    \item Correctness in shared-memory parallelism requires explicit reasoning about atomicity and ordering.
+    \item A single global lock is the simplest correctness mechanism, but it often eliminates scalability.
+    \item This example cleanly separates: (1) the \emph{spec} (invariant), (2) the \emph{race}, and (3) the \emph{cost} of naive synchronization.
+\end{itemize}
+\end{ppkey}
+
+\section{Summary}
+
+This chapter distinguished two fundamental but often conflated concepts:
+\begin{itemize}
+    \item \textbf{Mutual exclusion:} Serializes access to a critical section; one thread at a time.
+    \item \textbf{Atomicity:} Makes a sequence of operations appear indivisible to all observers.
+\end{itemize}
+Neither implies the other. The bank transfer example demonstrated how to achieve both using a global lock, while highlighting the performance cost. Chapter~\ref{ch:locks} provides the detailed API for implementing these patterns.
+
+\section{Exercises}
+
+\begin{ppexercises}
+  \ppexercise{Explain why \texttt{\#pragma omp atomic} cannot replace locks when you need to atomically update multiple variables.}
+  
+  \ppexercise{Modify Program~\ref{prog:atomic-transfer} to use per-account locks instead of a global lock. What additional care is needed to avoid deadlock? (Hint: consider lock ordering.)}
+  
+  \ppexercise{Consider a scenario where threads only read account balances without modifying them. Is mutual exclusion still necessary? What about atomicity? Justify your answer.}
+  
+  \ppexercise{Classify the following operations as requiring mutual exclusion, atomicity, both, or neither:
+  \begin{itemize}
+      \item Incrementing a shared counter
+      \item Reading a 64-bit value on a 32-bit architecture
+      \item Swapping two elements in an array
+      \item Appending to a log file
+  \end{itemize}}
+  
+  \ppexercise{In Program~\ref{prog:atomic-transfer}, replace the global lock with \texttt{\#pragma omp critical}. Does this change correctness? Performance? Explain.}
+  
+  \ppexercise{Design a fine-grained locking scheme for the bank transfer that avoids deadlock. Analyze the expected performance improvement over the global lock approach.}
+\end{ppexercises}
+
+\section*{References}
+\addcontentsline{toc}{section}{References}
+See the OpenMP Specification~\cite{openmp-spec} for authoritative documentation on \texttt{atomic} and other synchronization constructs.
